@@ -5,8 +5,8 @@ IndependentOperator class for depletion.
 """
 
 from __future__ import annotations
-from collections.abc import Iterable, Sequence
 from tempfile import TemporaryDirectory
+from typing import List, Tuple, Iterable, Optional, Union, Sequence
 
 import pandas as pd
 import numpy as np
@@ -21,14 +21,13 @@ import openmc
 from .chain import Chain, REACTIONS
 from .coupled_operator import _find_cross_sections, _get_nuclides_with_data
 import openmc.lib
-from openmc.mpi import comm
 
 _valid_rxns = list(REACTIONS)
 _valid_rxns.append('fission')
 _valid_rxns.append('damage-energy')
 
 
-def _resolve_chain_file_path(chain_file: str | None):
+def _resolve_chain_file_path(chain_file: str):
     if chain_file is None:
         chain_file = openmc.config.get('chain_file')
         if 'chain_file' not in openmc.config:
@@ -42,12 +41,12 @@ def _resolve_chain_file_path(chain_file: str | None):
 def get_microxs_and_flux(
         model: openmc.Model,
         domains,
-        nuclides: Iterable[str] | None = None,
-        reactions: Iterable[str] | None = None,
-        energies: Iterable[float] | str | None = None,
-        chain_file: PathLike | None = None,
+        nuclides: Optional[Iterable[str]] = None,
+        reactions: Optional[Iterable[str]] = None,
+        energies: Optional[Union[Iterable[float], str]] = None,
+        chain_file: Optional[PathLike] = None,
         run_kwargs=None
-    ) -> tuple[list[np.ndarray], list[MicroXS]]:
+    ) -> Tuple[List[np.ndarray], List[MicroXS]]:
     """Generate a microscopic cross sections and flux from a Model
 
     .. versionadded:: 0.14.0
@@ -125,15 +124,6 @@ def get_microxs_and_flux(
     flux_tally.scores = ['flux']
     model.tallies = openmc.Tallies([rr_tally, flux_tally])
 
-    if openmc.lib.is_initialized:
-        openmc.lib.finalize()
-
-        if comm.rank == 0:
-            model.export_to_model_xml()
-        comm.barrier()
-        # Reinitialize with tallies
-        openmc.lib.init(intracomm=comm)
-
     # create temporary run
     with TemporaryDirectory() as temp_dir:
         if run_kwargs is None:
@@ -143,15 +133,12 @@ def get_microxs_and_flux(
         run_kwargs.setdefault('cwd', temp_dir)
         statepoint_path = model.run(**run_kwargs)
 
-        if comm.rank == 0:
-            with StatePoint(statepoint_path) as sp:
-                rr_tally = sp.tallies[rr_tally.id]
-                rr_tally._read_results()
-                flux_tally = sp.tallies[flux_tally.id]
-                flux_tally._read_results()
+        with StatePoint(statepoint_path) as sp:
+            rr_tally = sp.tallies[rr_tally.id]
+            rr_tally._read_results()
+            flux_tally = sp.tallies[flux_tally.id]
+            flux_tally._read_results()
 
-    rr_tally = comm.bcast(rr_tally)
-    flux_tally = comm.bcast(flux_tally)
     # Get reaction rates and flux values
     reaction_rates = rr_tally.get_reshaped_data()  # (domains, groups, nuclides, reactions)
     flux = flux_tally.get_reshaped_data()  # (domains, groups, 1, 1)
@@ -196,7 +183,7 @@ class MicroXS:
         :data:`openmc.deplete.chain.REACTIONS`
 
     """
-    def __init__(self, data: np.ndarray, nuclides: list[str], reactions: list[str]):
+    def __init__(self, data: np.ndarray, nuclides: List[str], reactions: List[str]):
         # Validate inputs
         if data.shape[:2] != (len(nuclides), len(reactions)):
             raise ValueError(
@@ -218,12 +205,12 @@ class MicroXS:
     @classmethod
     def from_multigroup_flux(
         cls,
-        energies: Sequence[float] | str,
+        energies: Union[Sequence[float], str],
         multigroup_flux: Sequence[float],
-        chain_file: PathLike | None = None,
+        chain_file: Optional[PathLike] = None,
         temperature: float = 293.6,
-        nuclides: Sequence[str] | None = None,
-        reactions: Sequence[str] | None = None,
+        nuclides: Optional[Sequence[str]] = None,
+        reactions: Optional[Sequence[str]] = None,
         **init_kwargs: dict,
     ) -> MicroXS:
         """Generated microscopic cross sections from a known flux.
@@ -232,7 +219,7 @@ class MicroXS:
         sections available. MicroXS entry will be 0 if the nuclide cross section
         is not found.
 
-        .. versionadded:: 0.15.0
+        .. versionadded:: 0.14.1
 
         Parameters
         ----------
@@ -352,11 +339,10 @@ class MicroXS:
             kwargs['float_precision'] = 'round_trip'
 
         df = pd.read_csv(csv_file, **kwargs)
-        df.set_index(['nuclides', 'reactions', 'groups'], inplace=True)
+        df.set_index(['nuclides', 'reactions'], inplace=True)
         nuclides = list(df.index.unique(level='nuclides'))
         reactions = list(df.index.unique(level='reactions'))
-        groups = list(df.index.unique(level='groups'))
-        shape = (len(nuclides), len(reactions), len(groups))
+        shape = (len(nuclides), len(reactions))
         data = df.values.reshape(shape)
         return cls(data, nuclides, reactions)
 
@@ -377,10 +363,10 @@ class MicroXS:
             Keyword arguments passed to :meth:`pandas.DataFrame.to_csv`
 
         """
-        groups = self.data.shape[2]
         multi_index = pd.MultiIndex.from_product(
-            [self.nuclides, self.reactions, range(1, groups + 1)],
-            names=['nuclides', 'reactions', 'groups']
+            [self.nuclides, self.reactions],
+            names=['nuclides', 'reactions']
         )
         df = pd.DataFrame({'xs': self.data.flatten()}, index=multi_index)
         df.to_csv(*args, **kwargs)
+
