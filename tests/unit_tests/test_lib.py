@@ -5,6 +5,7 @@ import os
 import numpy as np
 import pytest
 import openmc
+from openmc.examples import random_ray_pin_cell
 import openmc.exceptions as exc
 import openmc.lib
 
@@ -84,6 +85,19 @@ def uo2_trigger_model():
 
 
 @pytest.fixture(scope='module')
+def random_ray_pincell_model():
+    """Set up a random ray model to test with and delete files when done"""
+    openmc.reset_auto_ids()
+    # Write XML and MGXS files in tmpdir
+    with cdtemp():
+        model = random_ray_pin_cell()
+        model.settings.batches = 200
+        model.settings.inactive = 50
+        model.settings.particles = 50
+        model.export_to_xml()
+        yield
+
+@pytest.fixture(scope='module')
 def lib_init(pincell_model, mpi_intracomm):
     openmc.lib.init(intracomm=mpi_intracomm)
     yield
@@ -157,6 +171,34 @@ def test_properties_temperature(lib_init):
     # Import properties and check that temperature is restored
     openmc.lib.import_properties('properties.h5')
     assert cell.get_temperature() == pytest.approx(200.0)
+
+
+def test_cell_density(lib_init):
+    cell = openmc.lib.cells[1]
+    print('density', cell.get_density())
+    orig_density = cell.get_density()
+    try:
+        cell.set_density(1.5, 0)
+        assert cell.get_density(0) == pytest.approx(1.5)
+        cell.set_density(2.0)
+        assert cell.get_density() == pytest.approx(2.0)
+    finally:
+        cell.set_density(orig_density)
+
+
+def test_properties_cell_density(lib_init):
+    # Cell density should be 2.0 from above test
+    cell = openmc.lib.cells[1]
+    orig_density = cell.get_density()
+
+    # Export properties and change density
+    openmc.lib.export_properties('properties.h5')
+    cell.set_density(3.0)
+    assert cell.get_density() == pytest.approx(3.0)
+
+    # Import properties and check that density is restored
+    openmc.lib.import_properties('properties.h5')
+    assert cell.get_density() == pytest.approx(orig_density)
 
 
 def test_new_cell(lib_init):
@@ -468,9 +510,6 @@ def test_set_n_batches(lib_run):
 
     for i in range(7):
         openmc.lib.next_batch()
-    # Setting n_batches less than current_batch should raise error
-    with pytest.raises(exc.InvalidArgumentError):
-        settings.set_batches(6)
     # n_batches should stay the same
     assert settings.get_batches() == 10
 
@@ -583,6 +622,13 @@ def test_regular_mesh(lib_init):
         assert isinstance(mesh, openmc.lib.RegularMesh)
         assert mesh_id == mesh.id
 
+    rotation = (180.0, 0.0, 0.0)
+
+    mf = openmc.lib.MeshFilter(mesh)
+    assert mf.mesh == mesh
+    mf.rotation = rotation
+    assert np.allclose(mf.rotation, rotation)
+
     translation = (1.0, 2.0, 3.0)
 
     mf = openmc.lib.MeshFilter(mesh)
@@ -601,18 +647,18 @@ def test_regular_mesh(lib_init):
     mesh.set_parameters(lower_left=(-0.63, -0.63, -0.5),
                         upper_right=(0.63, 0.63, 0.5))
     vols = mesh.material_volumes()
-    assert len(vols) == 4
-    for elem_vols in vols:
+    assert vols.num_elements == 4
+    for i in range(vols.num_elements):
+        elem_vols = vols.by_element(i)
         assert sum(f[1] for f in elem_vols) == pytest.approx(1.26 * 1.26 / 4)
 
-    # If the mesh extends beyond the boundaries of the model, the volumes should
-    # still be reported correctly
+    # If the mesh extends beyond the boundaries of the model, we should get a
+    # GeometryError
     mesh.dimension = (1, 1, 1)
     mesh.set_parameters(lower_left=(-1.0, -1.0, -0.5),
                         upper_right=(1.0, 1.0, 0.5))
-    vols = mesh.material_volumes(100_000)
-    for elem_vols in vols:
-        assert sum(f[1] for f in elem_vols) == pytest.approx(1.26 * 1.26, 1e-2)
+    with pytest.raises(exc.GeometryError, match="not fully contained"):
+        vols = mesh.material_volumes()
 
 
 def test_regular_mesh_get_plot_bins(lib_init):
@@ -683,11 +729,11 @@ def test_rectilinear_mesh(lib_init):
     mesh.set_grid([-w/2, -w/4, w/2], [-w/2, -w/4, w/2], [-0.5, 0.5])
 
     vols = mesh.material_volumes()
-    assert len(vols) == 4
-    assert sum(f[1] for f in vols[0]) == pytest.approx(w/4 * w/4)
-    assert sum(f[1] for f in vols[1]) == pytest.approx(w/4 * 3*w/4)
-    assert sum(f[1] for f in vols[2]) == pytest.approx(3*w/4 * w/4)
-    assert sum(f[1] for f in vols[3]) == pytest.approx(3*w/4 * 3*w/4)
+    assert vols.num_elements == 4
+    assert sum(f[1] for f in vols.by_element(0)) == pytest.approx(w/4 * w/4)
+    assert sum(f[1] for f in vols.by_element(1)) == pytest.approx(w/4 * 3*w/4)
+    assert sum(f[1] for f in vols.by_element(2)) == pytest.approx(3*w/4 * w/4)
+    assert sum(f[1] for f in vols.by_element(3)) == pytest.approx(3*w/4 * 3*w/4)
 
 
 def test_cylindrical_mesh(lib_init):
@@ -737,11 +783,11 @@ def test_cylindrical_mesh(lib_init):
     mesh.set_grid(r_grid, phi_grid, z_grid)
 
     vols = mesh.material_volumes()
-    assert len(vols) == 6
+    assert vols.num_elements == 6
     for i in range(0, 6, 2):
-        assert sum(f[1] for f in vols[i]) == pytest.approx(pi * 0.25**2 / 3)
+        assert sum(f[1] for f in vols.by_element(i)) == pytest.approx(pi * 0.25**2 / 3)
     for i in range(1, 6, 2):
-        assert sum(f[1] for f in vols[i]) == pytest.approx(pi * (0.5**2 - 0.25**2) / 3)
+        assert sum(f[1] for f in vols.by_element(i)) == pytest.approx(pi * (0.5**2 - 0.25**2) / 3)
 
 
 def test_spherical_mesh(lib_init):
@@ -795,14 +841,14 @@ def test_spherical_mesh(lib_init):
     mesh.set_grid(r_grid, theta_grid, phi_grid)
 
     vols = mesh.material_volumes()
-    assert len(vols) == 12
+    assert vols.num_elements == 12
     d_theta = theta_grid[1] - theta_grid[0]
     d_phi = phi_grid[1] - phi_grid[0]
     for i in range(0, 12, 2):
-        assert sum(f[1] for f in vols[i]) == pytest.approx(
+        assert sum(f[1] for f in vols.by_element(i)) == pytest.approx(
             0.25**3 / 3 * d_theta * d_phi * 2/pi)
     for i in range(1, 12, 2):
-        assert sum(f[1] for f in vols[i]) == pytest.approx(
+        assert sum(f[1] for f in vols.by_element(i)) == pytest.approx(
             (0.5**3 - 0.25**3) / 3 * d_theta * d_phi * 2/pi)
 
 
@@ -886,6 +932,60 @@ def test_property_map(lib_init):
 
     properties = openmc.lib.plot.property_map(s)
     assert np.allclose(expected_properties, properties, atol=1e-04)
+
+
+def test_solid_raytrace_plot(lib_init, pincell_model):
+    # Ensure plot mapping can be accessed and grows after allocation
+    n0 = len(openmc.lib.plots)
+    plot = openmc.lib.SolidRayTracePlot()
+    assert len(openmc.lib.plots) == n0 + 1
+    assert plot.id in openmc.lib.plots
+    assert openmc.lib.plots[plot.id] is plot
+
+    # Exercise plot property getters/setters
+    plot.pixels = (8, 6)
+    assert plot.pixels == (8, 6)
+
+    plot.color_by = openmc.lib.SolidRayTracePlot.COLOR_BY_MATERIAL
+    assert plot.color_by == openmc.lib.SolidRayTracePlot.COLOR_BY_MATERIAL
+
+    plot.camera_position = (2.0, 0.0, 1.0)
+    plot.look_at = (0.0, 0.0, 0.0)
+    plot.up = (0.0, 0.0, 1.0)
+    plot.light_position = (3.0, 2.0, 4.0)
+    plot.fov = 60.0
+    plot.diffuse_fraction = 0.4
+    assert plot.camera_position == pytest.approx((2.0, 0.0, 1.0))
+    assert plot.look_at == pytest.approx((0.0, 0.0, 0.0))
+    assert plot.up == pytest.approx((0.0, 0.0, 1.0))
+    assert plot.light_position == pytest.approx((3.0, 2.0, 4.0))
+    assert plot.fov == pytest.approx(60.0)
+    assert plot.diffuse_fraction == pytest.approx(0.4)
+
+    # Exercise color/visibility CAPI wrappers
+    plot.set_default_colors()
+    plot.set_color(1, (12, 34, 56))
+    assert plot.get_color(1) == (12, 34, 56)
+    plot.set_visibility(1, False)
+    plot.set_visibility(1, True)
+
+    # Confirm image creation path works and dimensions match pixels
+    plot.update_view()
+    image = plot.create_image()
+    assert image.shape == (6, 8, 3)
+    assert image.dtype == np.uint8
+
+    # Change some properties and confirm image changes
+    plot.set_color(1, (255, 0, 0))
+    plot.update_view()
+    image2 = plot.create_image()
+    assert not np.array_equal(image, image2)
+
+    # Solid raytrace uses Phong/diffuse shading, so rendered RGB values are
+    # generally modulated and need not exactly match the assigned palette.
+    changed = np.any(image != image2, axis=2)
+    assert np.any(changed)
+    assert np.mean(image2[..., 0][changed]) > np.mean(image[..., 0][changed])
 
 
 def test_position(lib_init):
@@ -1014,9 +1114,29 @@ def test_sample_external_source(run_in_tmpdir, mpi_intracomm):
         assert p1.time == p2.time
         assert p1.wgt == p2.wgt
 
+    # as_array should return a numpy structured array with matching values
+    arr = openmc.lib.sample_external_source(10, prn_seed=3, as_array=True)
+    assert isinstance(arr, np.ndarray)
+    assert len(arr) == 10
+    for p, row in zip(particles, arr):
+        assert p.r == pytest.approx(row['r'])
+        assert p.E == pytest.approx(row['E'])
+
     openmc.lib.finalize()
 
     # Make sure sampling works in volume calculation mode
     openmc.lib.init(["-c"])
     openmc.lib.sample_external_source(100)
+    openmc.lib.finalize()
+
+
+def test_random_ray(random_ray_pincell_model, mpi_intracomm):
+    openmc.lib.finalize()
+    openmc.lib.init(intracomm=mpi_intracomm)
+    openmc.lib.simulation_init()
+    openmc.lib.run_random_ray()
+    keff = openmc.lib.keff()
+
+    assert keff[0]==pytest.approx(1.3236826574065745)
+
     openmc.lib.finalize()

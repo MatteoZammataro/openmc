@@ -2,13 +2,14 @@
 
 #include "openmc/bank.h"
 #include "openmc/capi.h"
+#include "openmc/collision_track.h"
 #include "openmc/container_util.h"
 #include "openmc/eigenvalue.h"
 #include "openmc/error.h"
 #include "openmc/event.h"
 #include "openmc/geometry_aux.h"
+#include "openmc/ifp.h"
 #include "openmc/material.h"
-#include "openmc/mcpl_interface.h"
 #include "openmc/message_passing.h"
 #include "openmc/nuclide.h"
 #include "openmc/output.h"
@@ -29,7 +30,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#include "xtensor/xview.hpp"
+#include "openmc/tensor.h"
 
 #ifdef OPENMC_MPI
 #include <mpi.h>
@@ -117,9 +118,11 @@ int openmc_simulation_init()
   // Reset global variables -- this is done before loading state point (as that
   // will potentially populate k_generation and entropy)
   simulation::current_batch = 0;
+  simulation::ct_current_file = 1;
   simulation::ssw_current_file = 1;
   simulation::k_generation.clear();
   simulation::entropy.clear();
+  reset_source_rejection_counters();
   openmc_reset();
 
   // If this is a restart run, load the state point data and binary source
@@ -296,6 +299,7 @@ namespace openmc {
 
 namespace simulation {
 
+int ct_current_file;
 int current_batch;
 int current_gen;
 bool initialized {false};
@@ -335,11 +339,21 @@ void allocate_banks()
 
     // Allocate fission bank
     init_fission_bank(3 * simulation::work_per_rank);
+
+    // Allocate IFP bank
+    if (settings::ifp_on) {
+      resize_simulation_ifp_banks();
+    }
   }
 
   if (settings::surf_source_write) {
     // Allocate surface source bank
     simulation::surf_source_bank.reserve(settings::ssw_max_particles);
+  }
+
+  if (settings::collision_track) {
+    // Allocate collision track bank
+    collision_track_reserve_bank();
   }
 }
 
@@ -400,7 +414,7 @@ void finalize_batch()
 
   // Reset global tally results
   if (simulation::current_batch <= settings::n_inactive) {
-    xt::view(simulation::global_tallies, xt::all()) = 0.0;
+    simulation::global_tallies.fill(0.0);
     simulation::n_realizations = 0;
   }
 
@@ -439,17 +453,16 @@ void finalize_batch()
       int w = std::to_string(settings::n_max_batches).size();
       std::string source_point_filename = fmt::format("{0}source.{1:0{2}}",
         settings::path_output, simulation::current_batch, w);
-      gsl::span<SourceSite> bankspan(simulation::source_bank);
+      span<SourceSite> bankspan(simulation::source_bank);
       write_source_point(source_point_filename, bankspan,
         simulation::work_index, settings::source_mcpl_write);
     }
 
     // Write a continously-overwritten source point if requested.
     if (settings::source_latest) {
-      // note: correct file extension appended automatically
       auto filename = settings::path_output + "source";
-      gsl::span<SourceSite> bankspan(simulation::source_bank);
-      write_source_point(filename.c_str(), bankspan, simulation::work_index,
+      span<SourceSite> bankspan(simulation::source_bank);
+      write_source_point(filename, bankspan, simulation::work_index,
         settings::source_mcpl_write);
     }
   }
@@ -470,7 +483,7 @@ void finalize_batch()
       // Get span of source bank and calculate parallel index vector
       auto surf_work_index = mpi::calculate_parallel_index_vector(
         simulation::surf_source_bank.size());
-      gsl::span<SourceSite> surfbankspan(simulation::surf_source_bank.begin(),
+      span<SourceSite> surfbankspan(simulation::surf_source_bank.begin(),
         simulation::surf_source_bank.size());
 
       // Write surface source file
@@ -484,6 +497,10 @@ void finalize_batch()
       }
       ++simulation::ssw_current_file;
     }
+  }
+  // Write collision track file if requested
+  if (settings::collision_track) {
+    collision_track_flush_bank();
   }
 }
 
@@ -587,6 +604,9 @@ void initialize_history(Particle& p, int64_t index_source)
   // Reset weight window ratio
   p.ww_factor() = 0.0;
 
+  // set particle history start weight
+  p.wgt_born() = p.wgt();
+
   // Reset pulse_height_storage
   std::fill(p.pht_storage().begin(), p.pht_storage().end(), 0);
 
@@ -606,12 +626,16 @@ void initialize_history(Particle& p, int64_t index_source)
   // Set particle track.
   p.write_track() = check_track_criteria(p);
 
+  // Set the particle's initial weight window value.
+  p.wgt_ww_born() = -1.0;
+  apply_weight_windows(p);
+
   // Display message if high verbosity or trace is on
   if (settings::verbosity >= 9 || p.trace()) {
     write_message("Simulating Particle {}", p.id());
   }
 
-// Add paricle's starting weight to count for normalizing tallies later
+// Add particle's starting weight to count for normalizing tallies later
 #pragma omp atomic
   simulation::total_weight += p.wgt();
 
@@ -659,11 +683,12 @@ void calculate_work()
 void initialize_data()
 {
   // Determine minimum/maximum energy for incident neutron/photon data
-  data::energy_max = {INFTY, INFTY};
-  data::energy_min = {0.0, 0.0};
+  data::energy_max = {INFTY, INFTY, INFTY, INFTY};
+  data::energy_min = {0.0, 0.0, 0.0, 0.0};
+
   for (const auto& nuc : data::nuclides) {
     if (nuc->grid_.size() >= 1) {
-      int neutron = static_cast<int>(ParticleType::neutron);
+      int neutron = ParticleType::neutron().transport_index();
       data::energy_min[neutron] =
         std::max(data::energy_min[neutron], nuc->grid_[0].energy.front());
       data::energy_max[neutron] =
@@ -674,7 +699,7 @@ void initialize_data()
   if (settings::photon_transport) {
     for (const auto& elem : data::elements) {
       if (elem->energy_.size() >= 1) {
-        int photon = static_cast<int>(ParticleType::photon);
+        int photon = ParticleType::photon().transport_index();
         int n = elem->energy_.size();
         data::energy_min[photon] =
           std::max(data::energy_min[photon], std::exp(elem->energy_(1)));
@@ -687,12 +712,22 @@ void initialize_data()
       // Determine if minimum/maximum energy for bremsstrahlung is greater/less
       // than the current minimum/maximum
       if (data::ttb_e_grid.size() >= 1) {
-        int photon = static_cast<int>(ParticleType::photon);
+        int photon = ParticleType::photon().transport_index();
+        int electron = ParticleType::electron().transport_index();
+        int positron = ParticleType::positron().transport_index();
         int n_e = data::ttb_e_grid.size();
+
+        const std::vector<int> charged = {electron, positron};
+        for (auto t : charged) {
+          data::energy_min[t] = std::exp(data::ttb_e_grid(1));
+          data::energy_max[t] = std::exp(data::ttb_e_grid(n_e - 1));
+        }
+
         data::energy_min[photon] =
-          std::max(data::energy_min[photon], std::exp(data::ttb_e_grid(1)));
-        data::energy_max[photon] = std::min(
-          data::energy_max[photon], std::exp(data::ttb_e_grid(n_e - 1)));
+          std::max(data::energy_min[photon], data::energy_min[electron]);
+
+        data::energy_max[photon] =
+          std::min(data::energy_max[photon], data::energy_max[electron]);
       }
     }
   }
@@ -703,7 +738,7 @@ void initialize_data()
     // grid has not been allocated
     if (nuc->grid_.size() > 0) {
       double max_E = nuc->grid_[0].energy.back();
-      int neutron = static_cast<int>(ParticleType::neutron);
+      int neutron = ParticleType::neutron().transport_index();
       if (max_E == data::energy_max[neutron]) {
         write_message(7, "Maximum neutron transport energy: {} eV for {}",
           data::energy_max[neutron], nuc->name_);
@@ -720,7 +755,7 @@ void initialize_data()
   for (auto& nuc : data::nuclides) {
     nuc->init_grid();
   }
-  int neutron = static_cast<int>(ParticleType::neutron);
+  int neutron = ParticleType::neutron().transport_index();
   simulation::log_spacing =
     std::log(data::energy_max[neutron] / data::energy_min[neutron]) /
     settings::n_log_bins;
@@ -775,7 +810,7 @@ void transport_history_based_single_particle(Particle& p)
       p.event_advance();
     }
     if (p.alive()) {
-      if (p.collision_distance() > p.boundary().distance) {
+      if (p.collision_distance() > p.boundary().distance()) {
         p.event_cross_surface();
       } else if (p.alive()) {
         p.event_collide();

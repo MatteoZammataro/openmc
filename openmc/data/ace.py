@@ -9,9 +9,9 @@ unresolved resonance region, and tabulated data in the fast region. After the
 ENDF data has been reconstructed and Doppler-broadened, the ACER module
 generates ACE-format cross sections.
 
-.. _MCNP: https://laws.lanl.gov/vhosts/mcnp.lanl.gov/
-.. _NJOY: http://t2.lanl.gov/codes.shtml
-.. _ENDF: http://www.nndc.bnl.gov/endf
+.. _MCNP: https://mcnp.lanl.gov/
+.. _NJOY: https://www.njoy21.io/
+.. _ENDF: https://www.nndc.bnl.gov/endf-library/
 
 """
 
@@ -24,7 +24,7 @@ import numpy as np
 import openmc.checkvalue as cv
 from openmc.mixin import EqualityMixin
 from .data import ATOMIC_SYMBOL, gnds_name, EV_PER_MEV, K_BOLTZMANN
-from .endf import ENDF_FLOAT_RE
+from endf.records import ENDF_FLOAT_RE
 
 
 def get_metadata(zaid, metastable_scheme='nndc'):

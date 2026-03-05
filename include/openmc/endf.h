@@ -33,6 +33,13 @@ bool is_disappearance(int MT);
 //! \return Whether corresponding reaction is an inelastic scattering reaction
 bool is_inelastic_scatter(int MT);
 
+//! Determine whether an MT number matches a target MT, considering that the
+//! target may be a summation reaction.
+//! \param[in] event_mt MT number of the actual event
+//! \param[in] target_mt MT number to check against
+//! \return Whether event_mt is a component of target_mt (or equal to it)
+bool mt_matches(int event_mt, int target_mt);
+
 //==============================================================================
 //! Abstract one-dimensional function
 //==============================================================================
@@ -52,6 +59,10 @@ public:
   //! Construct polynomial from HDF5 data
   //! \param[in] dset Dataset containing coefficients
   explicit Polynomial(hid_t dset);
+
+  //! Construct polynomial from coefficients
+  //! \param[in] coef Polynomial coefficients
+  explicit Polynomial(vector<double> coef) : coef_(coef) {}
 
   //! Evaluate the polynomials
   //! \param[in] x independent variable

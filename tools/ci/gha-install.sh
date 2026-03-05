@@ -14,15 +14,9 @@ if [[ $DAGMC = 'y' ]]; then
     ./tools/ci/gha-install-dagmc.sh
 fi
 
-# Install NCrystal if needed
-if [[ $NCRYSTAL = 'y' ]]; then
-    ./tools/ci/gha-install-ncrystal.sh
-fi
-
-# Install vectfit for WMP generation if needed
-if [[ $VECTFIT = 'y' ]]; then
-    ./tools/ci/gha-install-vectfit.sh
-fi
+# Install NCrystal and verify installation
+pip install 'ncrystal>=4.1.0'
+nctool --test
 
 # Install libMesh if needed
 if [[ $LIBMESH = 'y' ]]; then
@@ -30,7 +24,7 @@ if [[ $LIBMESH = 'y' ]]; then
 fi
 
 # Install MCPL
-./tools/ci/gha-install-mcpl.sh
+pip install mcpl
 
 # For MPI configurations, make sure mpi4py and h5py are built against the
 # correct version of MPI
@@ -40,7 +34,9 @@ if [[ $MPI == 'y' ]]; then
     export CC=mpicc
     export HDF5_MPI=ON
     export HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/mpich
-    pip install --no-binary=h5py h5py
+    # Install h5py without build isolation to pick up already installed mpi4py
+    pip install setuptools Cython pkgconfig
+    pip install --no-build-isolation --no-binary=h5py h5py
 fi
 
 # Build and install OpenMC executable

@@ -7,10 +7,10 @@
 #include <string>
 
 #include "hdf5.h"
-#include <gsl/gsl-lite.hpp>
 
 #include "openmc/particle_data.h"
 #include "openmc/reaction_product.h"
+#include "openmc/span.h"
 #include "openmc/vector.h"
 
 namespace openmc {
@@ -26,14 +26,16 @@ public:
   //! Construct reaction from HDF5 data
   //! \param[in] group HDF5 group containing reaction data
   //! \param[in] temperatures Desired temperatures for cross sections
-  explicit Reaction(hid_t group, const vector<int>& temperatures);
+  //! \param[in] name Name of the nuclide
+  explicit Reaction(
+    hid_t group, const vector<int>& temperatures, std::string name);
 
   //! Calculate cross section given temperautre/grid index, interpolation factor
   //
   //! \param[in] i_temp Temperature index
   //! \param[in] i_grid Energy grid index
   //! \param[in] interp_factor Interpolation factor between grid points
-  double xs(gsl::index i_temp, gsl::index i_grid, double interp_factor) const;
+  double xs(int64_t i_temp, int64_t i_grid, double interp_factor) const;
 
   //! Calculate cross section
   //
@@ -47,8 +49,8 @@ public:
   //! \param[in] flux Flux in each energy group (not normalized per eV)
   //! \param[in] grid Nuclide energy grid
   //! \return Reaction rate
-  double collapse_rate(gsl::index i_temp, gsl::span<const double> energy,
-    gsl::span<const double> flux, const vector<double>& grid) const;
+  double collapse_rate(int64_t i_temp, span<const double> energy,
+    span<const double> flux, const vector<double>& grid) const;
 
   //! Cross section at a single temperature
   struct TemperatureXS {
@@ -74,11 +76,21 @@ public:
 //! \return Name of the corresponding reaction
 std::string reaction_name(int mt);
 
-//! Return reaction type (MT value) given a reaction name
+//! Return MT value for given a reaction name (including special tally MT
+//! values)
 //
 //! \param[in] name  Reaction name
-//! \return Corresponding reaction type (MT value)
-int reaction_type(std::string name);
+//! \return Corresponding MT number or special tally score
+int reaction_tally_mt(std::string name);
+
+//! Return ENDF MT number given a reaction name
+//
+//! Unlike reaction_tally_mt(), this function always returns a positive ENDF MT
+//! number and never a special negative tally score.
+//!
+//! \param[in] name  Reaction name
+//! \return Corresponding ENDF MT number
+int reaction_mt(const std::string& name);
 
 } // namespace openmc
 

@@ -4,39 +4,26 @@
 #include <cstdint>
 #include <unordered_map>
 
-#include <gsl/gsl-lite.hpp>
 #include <hdf5.h>
 #include <pugixml.hpp>
 
 #include "openmc/constants.h"
 #include "openmc/memory.h"
 #include "openmc/mesh.h"
-#include "openmc/particle.h"
+#include "openmc/particle_type.h"
+#include "openmc/span.h"
 #include "openmc/tallies/tally.h"
 #include "openmc/vector.h"
 
 namespace openmc {
 
-enum class WeightWindowUpdateMethod {
-  MAGIC,
-};
+enum class WeightWindowUpdateMethod { MAGIC, FW_CADIS };
 
 //==============================================================================
 // Constants
 //==============================================================================
 
 constexpr double DEFAULT_WEIGHT_CUTOFF {1.0e-38}; // default low weight cutoff
-
-//==============================================================================
-// Non-member functions
-//==============================================================================
-
-//! Apply weight windows to a particle
-//! \param[in] p  Particle to apply weight windows to
-void apply_weight_windows(Particle& p);
-
-//! Free memory associated with weight windows
-void free_memory_weight_windows();
 
 //==============================================================================
 // Global variables
@@ -73,6 +60,7 @@ struct WeightWindow {
   {
     lower_weight *= factor;
     upper_weight *= factor;
+    survival_weight *= factor;
   }
 };
 
@@ -106,7 +94,7 @@ public:
   //! Set the weight window ID
   void set_id(int32_t id = -1);
 
-  void set_energy_bounds(gsl::span<const double> bounds);
+  void set_energy_bounds(span<const double> bounds);
 
   void set_mesh(const std::unique_ptr<Mesh>& mesh);
 
@@ -127,8 +115,9 @@ public:
   //! \param[in] threshold Relative error threshold. Results over this
   //! threshold will be ignored \param[in] ratio Ratio of upper to lower
   //! weight window bounds
-  void update_magic(const Tally* tally, const std::string& value = "mean",
-    double threshold = 1.0, double ratio = 5.0);
+  void update_weights(const Tally* tally, const std::string& value = "mean",
+    double threshold = 1.0, double ratio = 5.0,
+    WeightWindowUpdateMethod method = WeightWindowUpdateMethod::MAGIC);
 
   // NOTE: This is unused for now but may be used in the future
   //! Write weight window settings to an HDF5 file
@@ -137,21 +126,21 @@ public:
 
   //! Retrieve the weight window for a particle
   //! \param[in] p  Particle to get weight window for
-  WeightWindow get_weight_window(const Particle& p) const;
+  std::pair<bool, WeightWindow> get_weight_window(const Particle& p) const;
 
   std::array<int, 2> bounds_size() const;
 
   const vector<double>& energy_bounds() const { return energy_bounds_; }
 
-  void set_bounds(const xt::xtensor<double, 2>& lower_ww_bounds,
-    const xt::xtensor<double, 2>& upper_bounds);
+  void set_bounds(const tensor::Tensor<double>& lower_ww_bounds,
+    const tensor::Tensor<double>& upper_bounds);
 
-  void set_bounds(const xt::xtensor<double, 2>& lower_bounds, double ratio);
+  void set_bounds(const tensor::Tensor<double>& lower_bounds, double ratio);
 
   void set_bounds(
-    gsl::span<const double> lower_bounds, gsl::span<const double> upper_bounds);
+    span<const double> lower_bounds, span<const double> upper_bounds);
 
-  void set_bounds(gsl::span<const double> lower_bounds, double ratio);
+  void set_bounds(span<const double> lower_bounds, double ratio);
 
   void set_particle_type(ParticleType p_type);
 
@@ -182,25 +171,24 @@ public:
 
   const std::unique_ptr<Mesh>& mesh() const { return model::meshes[mesh_idx_]; }
 
-  const xt::xtensor<double, 2>& lower_ww_bounds() const { return lower_ww_; }
-  xt::xtensor<double, 2>& lower_ww_bounds() { return lower_ww_; }
+  const tensor::Tensor<double>& lower_ww_bounds() const { return lower_ww_; }
+  tensor::Tensor<double>& lower_ww_bounds() { return lower_ww_; }
 
-  const xt::xtensor<double, 2>& upper_ww_bounds() const { return upper_ww_; }
-  xt::xtensor<double, 2>& upper_ww_bounds() { return upper_ww_; }
+  const tensor::Tensor<double>& upper_ww_bounds() const { return upper_ww_; }
+  tensor::Tensor<double>& upper_ww_bounds() { return upper_ww_; }
 
   ParticleType particle_type() const { return particle_type_; }
 
 private:
   //----------------------------------------------------------------------------
   // Data members
-  int32_t id_;       //!< Unique ID
-  gsl::index index_; //!< Index into weight windows vector
-  ParticleType particle_type_ {
-    ParticleType::neutron};      //!< Particle type to apply weight windows to
+  int32_t id_;                   //!< Unique ID
+  int64_t index_;                //!< Index into weight windows vector
+  ParticleType particle_type_;   //!< Particle type to apply weight windows to
   vector<double> energy_bounds_; //!< Energy boundaries [eV]
-  xt::xtensor<double, 2> lower_ww_; //!< Lower weight window bounds (shape:
+  tensor::Tensor<double> lower_ww_; //!< Lower weight window bounds (shape:
                                     //!< energy_bins, mesh_bins (k, j, i))
-  xt::xtensor<double, 2>
+  tensor::Tensor<double>
     upper_ww_; //!< Upper weight window bounds (shape: energy_bins, mesh_bins)
   double survival_ratio_ {3.0}; //!< Survival weight ratio
   double max_lb_ratio_ {1.0}; //!< Maximum lower bound to particle weight ratio
@@ -221,12 +209,11 @@ public:
   void create_tally();
 
   // Data members
-  int32_t tally_idx_;  //!< Index of the tally used to update the weight windows
-  int32_t ww_idx_;     //!< Index of the weight windows object being generated
-  std::string method_; //!< Method used to update weight window. Only "magic"
-                       //!< is valid for now.
-  int32_t max_realizations_; //!< Maximum number of tally realizations
-  int32_t update_interval_;  //!< Determines how often updates occur
+  int32_t tally_idx_; //!< Index of the tally used to update the weight windows
+  int32_t ww_idx_;    //!< Index of the weight windows object being generated
+  WeightWindowUpdateMethod method_; //!< Method used to update weight window.
+  int32_t max_realizations_;        //!< Maximum number of tally realizations
+  int32_t update_interval_;         //!< Determines how often updates occur
   bool on_the_fly_; //!< Whether or not to keep tally results between batches or
                     //!< realizations
 
@@ -237,6 +224,26 @@ public:
                            // update weight windows
   double ratio_ {5.0};     //<! ratio of lower to upper weight window bounds
 };
+
+//==============================================================================
+// Non-member functions
+//==============================================================================
+
+//! Apply weight windows to a particle
+//! \param[in] p  Particle to apply weight windows to
+void apply_weight_windows(Particle& p);
+
+//! Apply weight window to a particle
+//! \param[in] p  Particle to apply weight window to
+//! \param[in] weight_window WeightWindow to apply
+void apply_weight_window(Particle& p, WeightWindow weight_window);
+
+//! Free memory associated with weight windows
+void free_memory_weight_windows();
+
+//! Search weight window that apply to a particle
+//! \param[in]  p  Particle to search weight window for
+std::pair<bool, WeightWindow> search_weight_window(const Particle& p);
 
 //! Finalize variance reduction objects after all inputs have been read
 void finalize_variance_reduction();

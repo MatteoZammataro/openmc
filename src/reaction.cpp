@@ -1,17 +1,20 @@
 #include "openmc/reaction.h"
 
+#include <algorithm> // for remove_if
 #include <string>
 #include <unordered_map>
 #include <utility> // for move
 
 #include <fmt/core.h>
 
+#include "openmc/chain.h"
 #include "openmc/constants.h"
 #include "openmc/endf.h"
 #include "openmc/hdf5_interface.h"
 #include "openmc/random_lcg.h"
 #include "openmc/search.h"
 #include "openmc/secondary_uncorrelated.h"
+#include "openmc/settings.h"
 
 namespace openmc {
 
@@ -19,7 +22,8 @@ namespace openmc {
 // Reaction implementation
 //==============================================================================
 
-Reaction::Reaction(hid_t group, const vector<int>& temperatures)
+Reaction::Reaction(
+  hid_t group, const vector<int>& temperatures, std::string name)
 {
   read_attribute(group, "Q_value", q_value_);
   read_attribute(group, "mt", mt_);
@@ -63,10 +67,36 @@ Reaction::Reaction(hid_t group, const vector<int>& temperatures)
       close_group(pgroup);
     }
   }
+
+  if (settings::use_decay_photons) {
+    // Remove photon products for D1S method
+    products_.erase(std::remove_if(products_.begin(), products_.end(),
+                      [](const auto& p) { return p.particle_.is_photon(); }),
+      products_.end());
+
+    // Determine product for D1S method
+    auto nuclide_it = data::chain_nuclide_map.find(name);
+    if (nuclide_it != data::chain_nuclide_map.end()) {
+      const auto& chain_nuc = data::chain_nuclides[nuclide_it->second];
+      const auto& rx_products = chain_nuc->reaction_products();
+      auto product_it = rx_products.find(mt_);
+      if (product_it != rx_products.end()) {
+        auto decay_products = product_it->second;
+        for (const auto& decay_product : decay_products) {
+          auto product_it = data::chain_nuclide_map.find(decay_product.name);
+          if (product_it != data::chain_nuclide_map.end()) {
+            const auto& product_nuc = data::chain_nuclides[product_it->second];
+            if (product_nuc->photon_energy()) {
+              products_.emplace_back(decay_product);
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
-double Reaction::xs(
-  gsl::index i_temp, gsl::index i_grid, double interp_factor) const
+double Reaction::xs(int64_t i_temp, int64_t i_grid, double interp_factor) const
 {
   // If energy is below threshold, return 0. Otherwise interpolate between
   // nearest grid points
@@ -82,9 +112,8 @@ double Reaction::xs(const NuclideMicroXS& micro) const
   return this->xs(micro.index_temp, micro.index_grid, micro.interp_factor);
 }
 
-double Reaction::collapse_rate(gsl::index i_temp,
-  gsl::span<const double> energy, gsl::span<const double> flux,
-  const vector<double>& grid) const
+double Reaction::collapse_rate(int64_t i_temp, span<const double> energy,
+  span<const double> flux, const vector<double>& grid) const
 {
   // Find index corresponding to first energy
   const auto& xs = xs_[i_temp].value;
@@ -172,9 +201,13 @@ std::unordered_map<int, std::string> REACTION_NAME_MAP {
   {SCORE_FISS_Q_PROMPT, "fission-q-prompt"},
   {SCORE_FISS_Q_RECOV, "fission-q-recoverable"},
   {SCORE_PULSE_HEIGHT, "pulse-height"},
+  {SCORE_IFP_TIME_NUM, "ifp-time-numerator"},
+  {SCORE_IFP_BETA_NUM, "ifp-beta-numerator"},
+  {SCORE_IFP_DENOM, "ifp-denominator"},
   // Normal ENDF-based reactions
   {TOTAL_XS, "(n,total)"},
   {ELASTIC, "(n,elastic)"},
+  {N_NONELASTIC, "(n,nonelastic)"},
   {N_LEVEL, "(n,level)"},
   {N_2ND, "(n,2nd)"},
   {N_2N, "(n,2n)"},
@@ -276,6 +309,7 @@ std::unordered_map<int, std::string> REACTION_NAME_MAP {
   {N_XA, "(n,Xa)"},
   {HEATING, "heating"},
   {DAMAGE_ENERGY, "damage-energy"},
+  {PHOTON_TOTAL, "photon-total"},
   {COHERENT, "coherent-scatter"},
   {INCOHERENT, "incoherent-scatter"},
   {PAIR_PROD_ELEC, "pair-production-electron"},
@@ -313,13 +347,24 @@ void initialize_maps()
   // Create photoelectric subshells
   for (int mt = 534; mt <= 572; ++mt) {
     REACTION_NAME_MAP[mt] =
-      fmt::format("photoelectric, {} subshell", SUBSHELLS[mt - 534]);
+      fmt::format("photoelectric-{}", SUBSHELLS[mt - 534]);
   }
 
   // Invert name map to create type map
   for (const auto& kv : REACTION_NAME_MAP) {
     REACTION_TYPE_MAP[kv.second] = kv.first;
   }
+
+  // Alternate names
+  REACTION_TYPE_MAP["elastic"] = ELASTIC;
+  REACTION_TYPE_MAP["n2n"] = N_2N;
+  REACTION_TYPE_MAP["n3n"] = N_3N;
+  REACTION_TYPE_MAP["n4n"] = N_4N;
+  REACTION_TYPE_MAP["H1-production"] = N_XP;
+  REACTION_TYPE_MAP["H2-production"] = N_XD;
+  REACTION_TYPE_MAP["H3-production"] = N_XT;
+  REACTION_TYPE_MAP["He3-production"] = N_X3HE;
+  REACTION_TYPE_MAP["He4-production"] = N_XA;
 }
 
 std::string reaction_name(int mt)
@@ -337,62 +382,42 @@ std::string reaction_name(int mt)
   }
 }
 
-int reaction_type(std::string name)
+int reaction_tally_mt(std::string name)
 {
-  // Initialize remainder of name map and all of type map
+  // All "total" scores should map to the special SCORE_TOTAL
+  if (name == "total" || name == "(n,total)" || name == "photon-total")
+    return SCORE_TOTAL;
+
+  // All fission scores should map to the special SCORE_FISSION
+  if (name == "fission" || name == "(n,fission)")
+    return SCORE_FISSION;
+
+  // Delegate everything else to reaction_mt()
+  return reaction_mt(name);
+}
+
+int reaction_mt(const std::string& name)
+{
+  // Initialize maps if needed
   if (REACTION_TYPE_MAP.empty())
     initialize_maps();
 
-  // (n,total) exists in REACTION_TYPE_MAP for MT=1, but we need this to return
-  // the special SCORE_TOTAL score
-  if (name == "(n,total)")
-    return SCORE_TOTAL;
-
-  // Check if type map has an entry for this reaction name
+  // Look up directly in type map (no score indirection)
   auto it = REACTION_TYPE_MAP.find(name);
   if (it != REACTION_TYPE_MAP.end()) {
-    return it->second;
+    int mt = it->second;
+    return mt;
   }
 
-  // Alternate names for several reactions
-  if (name == "elastic") {
-    return ELASTIC;
-  } else if (name == "n2n") {
-    return N_2N;
-  } else if (name == "n3n") {
-    return N_3N;
-  } else if (name == "n4n") {
-    return N_4N;
-  } else if (name == "H1-production") {
-    return N_XP;
-  } else if (name == "H2-production") {
-    return N_XD;
-  } else if (name == "H3-production") {
-    return N_XT;
-  } else if (name == "He3-production") {
-    return N_X3HE;
-  } else if (name == "He4-production") {
-    return N_XA;
-  }
-
-  // Assume the given string is a reaction MT number.  Make sure it's a natural
-  // number then return.
+  // Assume the given string is an MT number
   int MT = 0;
   try {
     MT = std::stoi(name);
   } catch (const std::invalid_argument& ex) {
-    throw std::invalid_argument(
-      "Invalid tally score \"" + name +
-      "\". See the docs "
-      "for details: "
-      "https://docs.openmc.org/en/stable/usersguide/tallies.html#scores");
+    throw std::invalid_argument("Unknown reaction name \"" + name + "\".");
   }
   if (MT < 1)
-    throw std::invalid_argument(
-      "Invalid tally score \"" + name +
-      "\". See the docs "
-      "for details: "
-      "https://docs.openmc.org/en/stable/usersguide/tallies.html#scores");
+    throw std::invalid_argument("Unknown reaction name \"" + name + "\".");
   return MT;
 }
 

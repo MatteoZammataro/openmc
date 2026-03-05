@@ -37,6 +37,9 @@ Prerequisites
 - Some tests require `NJOY <https://www.njoy21.io/NJOY2016>`_ to preprocess
   cross section data. The test suite assumes that you have an ``njoy``
   executable available on your :envvar:`PATH`.
+- OpenMC should be compiled with ``-DOPENMC_ENABLE_STRICT_FP=on`` to ensure
+  reproducible floating-point results across platforms and optimization levels.
+  Without this flag, regression tests may not match reference values.
 
 Running Tests
 -------------
@@ -67,9 +70,11 @@ make sure you have satisfied all the prerequisites above. After you have done
 that, consider the following:
 
 - When building OpenMC, make sure you run CMake with
-  ``-DCMAKE_BUILD_TYPE=Debug``. Building with a release build will result in
-  some test failures due to differences in which compiler optimizations are
-  used.
+  ``-DOPENMC_ENABLE_STRICT_FP=on``. This prevents the compiler from applying
+  floating-point optimizations (such as replacing math library calls with
+  builtins or contracting multiply-add into FMA instructions) that can produce
+  bit-level differences across platforms and optimization levels. Any
+  ``CMAKE_BUILD_TYPE`` can be used.
 - Because tallies involve the sum of many floating point numbers, the
   non-associativity of floating point numbers can result in different answers
   especially when the number of threads is high (different order of operations).
@@ -83,6 +88,30 @@ that, consider the following:
   AVX512_SKX". When NumPy/SciPy are built against OpenBLAS, you may also need to
   limit the number of threads that OpenBLAS uses internally; this can be done by
   setting the :envvar:`OPENBLAS_NUM_THREADS` environment variable to 1.
+
+Debugging Tests in CI
+---------------------
+
+Tests can be debugged in CI using a feature called 
+`tmate <https://github.com/mxschmitt/action-tmate?tab=readme-ov-file#debug-your-github-actions-by-using-tmate>`_. 
+CI debugging can be
+enabled by including "[gha-debug]" in the commit message. When the test fails, a
+link similar to the one shown below will be provided in the GitHub Actions
+output after failure occurs. Logging into the provided link will allow you to
+debug the test in the CI environment. The following is an example of the output
+shown in the CI log that provides the link to the tmate session:
+
+.. code-block:: text
+   :linenos:
+
+   Created new session successfully
+   ssh 2VcykjU7vNdvAzEjQcc839GM2@nyc1.tmate.io
+   https://tmate.io/t/2VcykjU7vNdvAzEjQcc839GM2
+   Entering main loop
+   Web shell: https://tmate.io/t/2VcykjU7vNdvAzEjQcc839GM2
+   SSH: ssh 2VcykjU7vNdvAzEjQcc839GM2@nyc1.tmate.io
+   ...
+
 
 Generating XML Inputs
 ---------------------

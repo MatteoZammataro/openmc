@@ -26,7 +26,7 @@ ReactionProduct::ReactionProduct(hid_t group)
   // Read particle type
   std::string temp;
   read_attribute(group, "particle", temp);
-  particle_ = str_to_particle_type(temp);
+  particle_ = ParticleType {temp};
 
   // Read emission mode and decay rate
   read_attribute(group, "emission_mode", temp);
@@ -42,7 +42,7 @@ ReactionProduct::ReactionProduct(hid_t group)
   if (emission_mode_ == EmissionMode::delayed) {
     if (attribute_exists(group, "decay_rate")) {
       read_attribute(group, "decay_rate", decay_rate_);
-    } else if (particle_ == ParticleType::neutron) {
+    } else if (particle_.is_neutron()) {
       warning(fmt::format("Decay rate doesn't exist for delayed neutron "
                           "emission ({}).",
         object_name(group)));
@@ -81,6 +81,29 @@ ReactionProduct::ReactionProduct(hid_t group)
 
     close_group(dgroup);
   }
+}
+
+ReactionProduct::ReactionProduct(const ChainNuclide::Product& product)
+{
+  particle_ = ParticleType::photon();
+  emission_mode_ = EmissionMode::delayed;
+
+  // Get chain nuclide object for radionuclide
+  parent_nuclide_ = data::chain_nuclide_map.at(product.name);
+  const auto& chain_nuc = data::chain_nuclides[parent_nuclide_].get();
+
+  // Determine decay constant in [s^-1]
+  decay_rate_ = chain_nuc->decay_constant();
+
+  // Determine number of photons per decay and set yield
+  double photon_per_sec = chain_nuc->photon_energy()->integral();
+  double photon_per_decay = photon_per_sec / decay_rate_;
+  vector<double> coef = {product.branching_ratio * photon_per_decay};
+  yield_ = make_unique<Polynomial>(coef);
+
+  // Set decay photon angle-energy distribution
+  distribution_.push_back(
+    make_unique<DecayPhotonAngleEnergy>(chain_nuc->photon_energy()));
 }
 
 void ReactionProduct::sample(
