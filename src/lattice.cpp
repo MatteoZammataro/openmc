@@ -279,7 +279,7 @@ std::pair<double, array<int, 3>> RectLattice::distance(
   }
   
   if (is_3d_ && dz < d) { 
-      d = dz; axis = 2; 
+      d = dz;
       lattice_trans[0] =  0;
       lattice_trans[1] =  0;
       lattice_trans[2] =  copysign(1, u.z);
